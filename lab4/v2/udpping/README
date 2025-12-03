@@ -1,0 +1,117 @@
+# Lab 2 Problem 3: UDP Ping Application
+
+For this problem, we implement a UDP-based ping application. The server (`udppings`) listens for UDP datagrams containing a 6-byte secret followed by a 4-byte sequence number. The client (`udppingc`) sends a sequence of ping requests and measures round-trip times (RTT) for replies from the server.
+
+Some notes:
+
+- For this problem, we are using UDP (`socket()`, `bind()`, `sendto()`, `recvfrom()`).
+- We have a simple iterative server that responds directly to each datagram without forking.
+- Client binds to a specific local port (`portnum2`), sends `pcount` ping packets, and uses `setitimer()` with 1.234567s timeout to detect lost requests.
+
+## Repository layout (lab2/v3)
+
+The implementation is split across small modules; function prototypes come from the header files in this directory.
+
+- `udppings.c` (server main)
+	- `main(int argc, char **argv)` — parse `port` and `secret`, call `setup_udp_server(port)`, and run `process_ping_requests(sockfd, secret)`.
+
+- `udppingc.c` (client main)
+	- `main(int argc, char **argv)` — parse `servip`, `portnum`, `secret`, `portnum2`, and `pcount`; call `setup_udp_client(servip, portnum2)` to create and bind the client socket; compute a random initial sequence number in [0,999]; call `send_ping_requests()` to perform pcount probes and collect RTTs; finally call `calculate_statistics()` to summarize results.
+
+- `setup_udp_server.c` / `setup_udp_server.h`
+	- `int setup_udp_server(int port)` — create a UDP socket, bind it to the specified `port` on INADDR_ANY, and return the socket fd (or -1 on error).
+
+- `process_ping_requests.c` / `process_ping_requests.h`
+	- `void process_ping_requests(int sockfd, const char *secret)` — iterative server loop: call `recvfrom()` to receive datagrams, verify the first 6 bytes match `secret`, and if valid `sendto()` a response back to the client's address containing the same payload (secret + sequence number) so the client can match replies.
+
+- `setup_udp_client.c` / `setup_udp_client.h`
+	- `int setup_udp_client(const char *server_ip, int client_port)` — create a UDP socket and bind it to `client_port` (the local port the client must use). Returns the socket fd or exits/returns -1 if bind fails.
+
+- `send_ping_requests.c` / `send_ping_requests.h`
+	- `void set_server_address(const char *server_ip, int server_port)` — helper to store the server sockaddr for use by send/recv calls.
+	- `void send_ping_requests(int sockfd, const char *secret, unsigned int initial_seq, int pcount, double *rtt_array)` — send pcount ping datagrams starting with `initial_seq` (subsequent seqs incremented), use `setitimer()` to set a 1.234567s timeout before blocking `recvfrom()`, timestamp each send with `gettimeofday()`, and on valid reply cancel the alarm and record RTT in `rtt_array` (in microseconds); on timeout store 0 for that probe.
+
+- `alarm_handler_udp.c` / `alarm_handler_udp.h`
+	- `extern volatile sig_atomic_t alarm_sent_off;`
+	- `void alarm_handler_udp(int sig)` — SIGALRM handler that sets `alarm_sent_off` to indicate a timeout and causes blocking `recvfrom()` to be interrupted.
+
+- `install_alarm_handler_udp.c` / `install_alarm_handler_udp.h`
+	- `int install_alarm_handler(void)` — helper to register `alarm_handler_udp` and return success/failure.
+
+- `calculate_statistics.c` / `calculate_statistics.h`
+	- `void calculate_statistics(const double *rtt_array, int pcount)` — compute and print summary statistics: min, max, average, and standard deviation of non-zero RTT samples. RTTs with value 0 indicate lost probes and are excluded from mean/stddev but counted in packet-loss statistics.
+
+## Payload & byte-ordering
+
+- Each packet payload is exactly 10 bytes: the 6-byte secret (ASCII, no NUL) followed by a 4-byte unsigned int sequence number in network byte order (big-endian). Use `htonl()`/`ntohl()` when converting the sequence number before placing it into the UDP payload or after extracting it.
+- For this application the exact machine endianness matters for constructing the 4-byte sequence number, so we have to convert to network byte order before transmit and back to host order upon receipt.
+
+## RTT measurement and timeout
+
+- The client sets a 1.234567 second timer using `setitimer(ITIMER_REAL, &timer, NULL)` before each `recvfrom()` call.
+- Record the send time with `gettimeofday()` immediately before `sendto()` and compute RTT by subtracting that timestamp from the timestamp taken on successful `recvfrom()`. This yields microsecond resolution RTT estimates.
+- If `recvfrom()` is interrupted by SIGALRM (errno == EINTR) or returns without a matching secret/sequence number (older sequence), treat the probe as lost and record RTT value 0 for that ping; then proceed with the next sequence number.
+
+## Client sequence numbering
+
+- The initial sequence number is chosen uniformly randomly from {0, 1, 2, ..., 999}. Each subsequent probe increments the sequence number by 1.
+
+## Building
+
+Run `make` in this directory to build `udppings` and `udppingc`. A `Makefile` in this directory compiles the object files and creates the two executables and provides a `clean` target.
+
+Example:
+
+```bash
+cd lab2/v3
+make
+```
+
+## Running
+
+1. Start the server on machine A / terminal A:
+
+```bash
+./udppings <portnum> <secret>
+```
+
+2. On machine B / terminal B start the client (bind to a local of your choice):
+
+```bash
+./udppingc <servip> <portnum> <secret> <client_portnum> <pcount>
+```
+
+3. Observe per-probe output (sequence number, RTT in microseconds, and whether it timed out). At the end, the client prints statistics: sent, received, loss percentage, min/avg/max/stddev RTT.
+
+4. For local testing on a single machine, use `127.0.0.1` for `servip` and two different terminals for server and client; ensure `client_portnum` is not in use.
+
+## Testing and Final Notes
+
+- Set pcount ≤ 100 during correctness tests.
+- Finally, try to connect to a port that is occupied (you can do this using two machines, one of which is getting timeouts from the server), you will see that appropriate message is shown and you cannot connect.
+- Verify that the server echoes back the exact payload and that the client only counts replies that both match the secret and the expected sequence number.
+- We have also compared results with `/bin/ping` for similar timings and reported the difference in `lab2.pdf`.
+
+For example:
+```bash
+./udppings 8080 123456
+```
+
+2. On machine B / terminal B start the client (bind to a local of your choice):
+
+```bash
+./udppingc 127.0.0.1 8080 123456 80801 10
+```
+
+and the output is:
+```
+--- UDP Ping Statistics ---
+Packets sent: 10
+Packets received: 10
+Packet loss: 0.0%
+RTT Avg = 41.10 us
+RTT Min = 28.00 us
+RTT Max = 109.00 us
+RTT STD = 23.06 us
+--- UDP Ping Statistics ---
+```

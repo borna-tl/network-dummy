@@ -1,0 +1,180 @@
+# Single-Hop Tunneling Server and Client
+
+## Overview
+This implements a single-hop UDP tunneling system where a tunneling server (tvpns) forwards UDP packets between a client and a final destination, hiding the true source and destination identities.
+
+## Files
+- `tvpns.c` - Tunneling server that accepts TCP control connections and forwards UDP data
+- `tvpnc.c` - Tunneling client that sets up tunnel sessions via TCP
+- `utilities.c` - Some utilities used by tvpns
+- `server_child.c` - After forking in tvpns, the child portion is included in this file to handle communication with ping server
+- `Makefile` - Build script
+
+## Functions & Methods (detailed)
+
+This section lists the main functions across the codebase and describes their roles and important behavior. 
+
+- `int main(int argc, char *argv[])` (in `tvpns.c`)
+  - Program entry for the tunneling server. Validates CLI args (`server_ip`, `port`, `secret`), checks the secret length (6 bytes), initializes the forwarding table (`initialize_forward_table()`), and sets `SIGCHLD` to `SIG_IGN` to avoid zombies.
+  - Creates a TCP listening socket, binds to the provided server IP and port, and calls `listen()`.
+  - Accepts TCP connections in a loop. For each accepted connection it reads a 2-byte connection request (expects value 315), a 6-byte secret (verifies it), a 4-byte destination IPv4 address, a 2-byte destination port, and a 4-byte source IPv4 address.
+  - Finds a free session slot via `find_free_session_slot()` and populates the `forwardtab` entry with the dest/source addresses and destination port. It then forks a child and calls `run_child_session()` in the child to handle forwarding for that session.
+
+- `void initialize_forward_table()` (in `utilities.c`)
+  - Zeroes the global `forwardtab` array. Called at server startup to mark all session slots free.
+
+- `int find_free_session_slot()` (in `utilities.c`)
+  - Scans the `forwardtab` array for an entry whose `sourceaddr` is 0 (unused) and returns its index or -1 if none available.
+
+- `void run_child_session(int session_idx, int client_sockfd, char *secret)` (in `server_child.c`)
+  - Executed in a forked child to handle one tunneling session end-to-end.
+  - Creates two UDP sockets:
+    - A *client-facing* UDP socket bound to the first available port starting at `BASE_UDP_PORT` (55500). This is the port the client will send UDP packets to.
+    - A *destination-facing* UDP socket bound to the first available port starting at `BASE_TUNNEL_PORT` (57500). This socket is used to send to and receive from the true destination.
+  - Sends an 8-byte TCP response back to the control client containing the 6-byte secret followed by the 2-byte assigned client UDP port (network byte order).
+  - Enters a `select()` loop monitoring the TCP control socket and both UDP sockets:
+    - If the TCP control socket becomes readable and a valid 6-byte secret termination message is received, the child tears down sockets and exits.
+    - When data arrives on the client-facing UDP socket, the child records the client's source port (first packet), forwards the payload to the destination address/port stored in the session table via `sendto()` on the destination-facing socket.
+    - When data arrives on the destination-facing UDP socket, the child forwards it to the client by sending to the client's IP/port using the client-facing socket.
+  - The child updates `forwardtab[session_idx].sourcept` on first-packet receipt to enable correct return-path forwarding.
+
+- `int main(int argc, char *argv[])` (in `tvpnc.c`)
+  - Program entry for the tunneling client. Validates CLI args (`server_ip`, `server_port`, `secret`, `client_ip`, `dest_ip`, `dest_port`) and creates a TCP socket to connect to the tunneling server.
+  - Sends a 2-byte connection request with value 315 (network byte order), the 6-byte secret, the 4-byte destination IP (network order), the 2-byte destination port (network order), and the 4-byte source IP (network order).
+  - Reads the server's 8-byte response (6-byte secret + 2-byte assigned UDP port). Verifies the secret and prints the assigned UDP port and a suggested `udppingc` command.
+  - Keeps the TCP connection open until the user hits Enter, at which point it sends the 6-byte secret as a termination request and closes the connection.
+
+## Compilation
+```bash
+make
+```
+
+This creates two executables: `tvpns` and `tvpnc`
+
+## Usage
+
+### 1. Start the tunneling server (tvpns)
+Run on a lab machine (e.g., amber05):
+```bash
+./tvpns 10.168.53.14 61112 abcABC
+```
+
+Parameters:
+- `10.168.53.14` - Server's IPv4 address
+- `61112` - TCP port for control connections
+- `abcABC` - 6-character secret key
+
+### 2. Start the UDP ping server (udppings)
+Run on destination machine (e.g., amber06):
+```bash
+./udppings 56001 abcABC
+```
+- Note: for ease of usage, we have included a udpping client and server code in ```lab4/v2/udpping```.
+### 3. Set up tunnel (tvpnc)
+Run on a client machine (e.g., amber02):
+```bash
+./tvpnc 10.168.53.14 61112 abcABC 10.168.53.13 10.168.53.15 56001
+```
+
+Parameters:
+- `10.168.53.14 61112` - Tunneling server coordinates
+- `abcABC` - Secret key (must match server)
+- `10.168.53.13` - UDP client machine IP (e.g., amber04)
+- `10.168.53.15 56001` - Final destination (ping server) coordinates
+
+The client will output the UDP port number to use (e.g., 55500)
+
+### 4. Run UDP ping client (udppingc)
+Run on client machine (e.g., amber04):
+```bash
+./udppingc 10.168.53.14 55500 abcABC 50001 10
+```
+
+Parameters:
+- `10.168.53.14` - Tunneling server IP (NOT ping server IP)
+- `55500` - Port returned by tvpnc
+- `abcABC` - Ping authentication secret
+- `50001` - Local port for client to bind
+- `10` - Number of ping packets
+
+## Protocol Details
+
+### Control Plane (TCP)
+The tunneling server uses TCP for session setup and teardown:
+
+**Setup Request (from tvpnc to tvpns):**
+1. 2 bytes: Connection request (value 315 in network byte order)
+2. 6 bytes: Secret key
+3. 4 bytes: Destination IPv4 address
+4. 2 bytes: Destination port (network byte order)
+5. 4 bytes: Source IPv4 address
+
+**Setup Response (from tvpns to tvpnc):**
+1. 6 bytes: Secret key (verification)
+2. 2 bytes: UDP port number (network byte order)
+
+**Teardown Request:**
+- 6 bytes: Secret key (sent by tvpnc to terminate session)
+
+### Data Plane (UDP)
+- Client sends UDP packets to tvpns at the assigned port
+- tvpns forwards packets to final destination
+- Responses from destination are forwarded back to client
+- Client is unaware of true destination; destination sees tvpns as source
+
+## Architecture
+
+### tvpns (Server)
+- **Parent Process**: Listens on TCP socket for control connections
+  - Validates connection requests (value 315)
+  - Verifies secret key
+  - Maintains forwarding table (max 8 sessions)
+  - Forks child processes for each session
+
+- **Child Process**: Handles packet forwarding
+  - Creates two UDP sockets:
+    - Socket 1: Binds to port 55500+ for client communication
+    - Socket 2: Binds to port 57500+ for destination communication
+  - Uses `select()` to monitor TCP and both UDP sockets
+  - Forwards packets bidirectionally
+  - Terminates on secret key received via TCP
+
+### tvpnc (Client)
+- Connects to tvpns via TCP
+- Sends tunnel setup request with destination info
+- Receives UDP port for data transmission
+- Waits for user input to terminate session
+- Sends termination request
+
+## Forwarding Table Structure
+```c
+struct tunneltab {
+    unsigned long destaddr;    // Destination IP address
+    unsigned short destpt;     // Destination port
+    unsigned long sourceaddr;  // Source IP address
+    unsigned short sourcept;   // Source port (dynamically assigned)
+    unsigned short tunnelpt;   // Tunnel port (dynamically assigned)
+};
+```
+
+## Testing Sample Output (on udppingc)
+```
+--- Ping Statistics ---
+Packets sent: 10
+Packets received: 10
+Packet loss: 0.0%
+RTT Avg = 1081.60 us
+RTT Min = 875.00 us
+RTT Max = 1636.00 us
+RTT STD = 235.21 us
+--- Ping Statistics ---
+```
+
+## Notes
+- All multi-byte integers use network byte order (big-endian)
+- Maximum of 8 simultaneous tunneling sessions (NUMSESSIONS)
+- UDP ports start at 55500 for client sockets
+- UDP ports start at 57500 for tunnel sockets
+- Secret key must be exactly 6 ASCII characters
+- Secret key is sent from the client and received on server to request termination.
+- Connection request value must be exactly 315
