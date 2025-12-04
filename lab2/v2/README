@@ -1,0 +1,88 @@
+# Lab 2 Problem 2: TCP Command Server with Client-side Output Delivery and Timeout
+
+This `v2/` directory contains a revised implementation of the authenticated TCP command server (`tcpcmds`) and client (`tcpcmdc`) from `v1/`. Here are the added features:
+
+- Command output from the executed program runs on the server but is sent back to the requesting client (not printed on the server's stdout). The server achieves this by using `dup2()` to make `stdout` (file descriptor 1) refer to the client's socket in the child before calling `execvp()`.
+- The client installs a SIGALRM handler and sets an alarm for 3 seconds before blocking in `read()` to get the server response. If the alarm sets off before the server response arrives, the client prints a timeout message and stops waiting.
+
+## Repository layout (lab2/v2)
+
+The following files implement the server and client. 
+
+Server-side and shared files
+
+- `tcpcmds.c`
+  - `main(int argc, char **argv)` — parse `port` and `secret`, install SIGINT handler, create server socket with `setup_server()`, and call `process_client_loop()`.
+
+- `setup_server.c` / `setup_server.h`
+  - `int setup_server(int port)` — create a TCP socket, bind to the given port, listen, and return the listening server fd.
+
+- `process_client_loop.c` / `process_client_loop.h`
+  - `void process_client_loop(int server_fd, const char *secret, size_t max_len)` — main select()-based loop that accepts new clients and reads requests. Delegates per-request handling to `handle_client()`.
+
+- `handle_client.c` / `handle_client.h`
+  - `int handle_client(int client_fd, const char *secret, size_t max_len)` — read a newline-terminated request from `client_fd` (character-by-character), verify the 6-character `secret`, validate the command (single word, <= max_len, no arguments). If valid, call `execute_command(cmd, client_fd)` to run the command with stdout directed at the client socket. Return value indicates whether the connection should remain open.
+
+- `execute_command.c` / `execute_command.h`
+  - `void execute_command(char *cmd, int client_fd)` — forks a child; in the child, optionally sleep 1 second (as required by assignment), then use `dup2(client_fd, 1)` to redirect stdout to the client socket, and call `execvp()` to run the legacy command. The parent waits for the child.
+
+Signal handling
+
+- `install_sigint_handler.c` / `install_sigint_handler.h`
+  - `int install_sigint_handler(void)` — install a SIGINT handler for graceful shutdown of the server.
+
+- `sigint_handler.c` / `sigint_handler.h`
+  - `extern volatile sig_atomic_t should_exit;`
+  - `void sigint_handler(int sig)` — sets `should_exit = 1` so the main loop can exit cleanly and close sockets.
+
+Client-side additions
+
+- `tcpcmdc.c`
+  - `main(int argc, char **argv)` — parse server IP, port, and secret; connect to the server; read user input (single-word commands); prepend the secret and send the request; set a 3-second alarm and call `read()` on the socket to receive the command output from the server; on successful read, cancel the alarm and write the received bytes to `stdout`.
+  - `connect_server(char *server_ip, int port)` — helper to create and connect a client socket.
+
+- `install_alarm_handler.c` / `install_alarm_handler.h`
+  - `int install_alarm_handler(void)` — install the SIGALRM handler (`myalrmhandler`) used by the client to interrupt a blocking `read()` after 3 seconds.
+
+- `alarm_handler.c` / `alarm_handler.h`
+  - `extern volatile sig_atomic_t alarm_sent_off;`
+  - `void myalrmhandler(int sig)` — handler that sets the `alarm_sent_off` flag and interrupts blocking `read()` (the handler runs when the alarm expires).
+
+Notes on implementation:
+
+- Redirecting command output back to client: the server's `execute_command()` now receives the `client_fd` and, in the child before `execvp()`, calls `dup2(client_fd, STDOUT_FILENO)` and closes any unused descriptors. This causes the legacy program's stdout to be written into the TCP connection to the client. The server should avoid printing the child output on its own stdout.
+
+- Client-side 3-second timeout: before the client calls `read()` to block for the server's response, it calls `alarm(3)`. If a response arrives before 3 seconds, the client reads it, calls `alarm(0)` to cancel the alarm, and writes the bytes to stdout. If the alarm fires first, `myalrmhandler()` runs, sets a flag, and causes `read()` to be interrupted (returning -1 with `errno == EINTR`). The client checks for this condition and prints a suitable timeout message.
+
+## Build
+
+Is similar to `v1/`.
+
+Example:
+
+```bash
+cd lab2/v2
+make
+```
+
+## Run & test
+
+1. Start server:
+
+```bash
+./tcpcmds <port> <secret>
+```
+
+2. Start client in another terminal:
+
+```bash
+./tcpcmdc <server-ip> <port> <secret>
+```
+
+3. At the client prompt enter a single-word command (e.g., `ls`, `ps`, `date`). The client sends the request and blocks on `read()` waiting for the server's response. If the server executes the command and sends output, the client will print that output. If no response arrives within 3 seconds, the client prints a timeout message and resumes the prompt.
+
+
+#### Testing is similar to before. We can additionally:
+4. Try multiple clients simultaneously to confirm that each client receives its own command output.
+
+5. Issue a command that sleeps longer than 3 seconds (or simulate a delayed server response) and verify client times out after 3 seconds with the correct message. I verified this by changing the amount of sleep in server side from 1 to 5 seconds.

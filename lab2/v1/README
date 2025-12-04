@@ -1,0 +1,82 @@
+# Lab 2 Problem 1: TCP Command Server
+
+This project implements a simple authenticated TCP command server (`tcpcmds`) and a corresponding client (`tcpcmdc`). The server accepts connections from multiple clients, validates a 6-character secret token prepended to each command, and executes single-word commands (no arguments) on behalf of clients.
+
+## Repository layout (lab2/v1)
+
+Files included in this directory and their roles:
+
+- `tcpcmds.c` — Server main program. Responsible for parsing arguments (port and secret), installing the SIGINT handler, creating the server socket and invoking the main processing loop.
+- `tcpcmdc.c` — Client main program (connects to server, reads user input containing secret, sends requests).
+- `setup_server.c` / `setup_server.h` — Helpers to create, bind and listen on the server socket:
+  - `int setup_server(int port)` — Create a TCP socket, bind to `port` on INADDR_ANY, start listening and return the server file descriptor (or -1 on error).
+- `process_client_loop.c` / `process_client_loop.h` — Server event loop and connection management:
+  - `void process_client_loop(int server_fd, const char *secret, size_t max_len)` — Run the main server loop. Uses `select()` to monitor the listening socket and client sockets, accepts new connections, reads client requests line-by-line, and calls `handle_client()` for processing.
+- `handle_client.c` / `handle_client.h` — Per-client request handling:
+  - `int handle_client(int client_fd, const char *secret, size_t max_len)` — Read bytes from `client_fd` (character-at-a-time), accumulate until newline, verify that the request begins with `secret`, validate the command (single word, <= max length, no arguments), then call `execute_command()` to run the command. Returns a status code to indicate whether the connection should remain open.
+- `execute_command.c` / `execute_command.h` — Command execution wrapper:
+  - `void execute_command(char *cmd)` — Forks and in the child executes `cmd` via `execvp()` (after the required 1-second sleep as specified by the previous assignment). Parent waits for child to finish and handles exit status.
+- `install_sigint_handler.c` / `install_sigint_handler.h` — SIGINT setup wrapper:
+  - `int install_sigint_handler(void)` — Install signal handler for SIGINT so the server can shut down cleanly.
+- `sigint_handler.c` / `sigint_handler.h` — Signal handler implementation and flag:
+  - `extern volatile sig_atomic_t should_exit` — Global flag set by the SIGINT handler.
+  - `void sigint_handler(int sig)` — Signal handler that sets `should_exit = 1` (used by the main loop to break and clean up).
+
+## Public functions and shorthand descriptions (from headers)
+
+- `int setup_server(int port)` (in `setup_server.h`) — create and return listening server socket fd or -1 on failure.
+- `void process_client_loop(int server_fd, const char *secret, size_t max_len)` (in `process_client_loop.h`) — main loop that manages clients and delegates request handling.
+- `int handle_client(int client_fd, const char *secret, size_t max_len)` (in `handle_client.h`) — read a request from `client_fd`, validate secret and command, call `execute_command()`; returns 0/1 to indicate connection state.
+- `void execute_command(char *cmd)` (in `execute_command.h`) — execute the validated command in a child process (execvp).
+- `int install_sigint_handler(void)` (in `install_sigint_handler.h`) — install SIGINT handler; returns 0 on success.
+- `extern volatile sig_atomic_t should_exit` and `void sigint_handler(int sig)` (in `sigint_handler.h`) — flag and handler to support graceful shutdown.
+
+## Building
+
+To build both server and client, run `make` inside this directory. The Makefile provided compiles the sources into two executables:
+
+- `tcpcmds` — the server
+- `tcpcmdc` — the client
+
+Example:
+
+```bash
+cd lab2/v1
+make
+```
+
+## Running
+
+Start the server with a port and a 6-character secret token:
+
+```bash
+./tcpcmds <port> <secret>
+```
+
+Start the client and provide server IP, port and the same secret:
+
+```bash
+./tcpcmdc <server_ip> <port> <secret>
+```
+
+Client usage notes:
+- The client prompts for a single-word command (no spaces/arguments). The client prepends the 6-character secret to the command and sends it terminated by a newline. Commands longer than 25 characters will be rejected.
+
+Server behavior notes:
+- The server validates incoming requests start with the secret token. If valid, it extracts the command (single word), forks a child to execute it, waits for the child to finish and returns status to the client. The server supports multiple simultaneous clients using `select()` and keeps running until SIGINT (Ctrl-C) is received.
+
+## Testing sample
+
+1. Build with `make`.
+2. In terminal A run `./tcpcmds 8080 123456`.
+3. In terminal B run `./tcpcmdc 127.0.0.1 8080 123456`.
+4. Enter `pwd` or `ls` at the client prompt (single-word commands only).
+5. Verify server executes the command and client receives appropriate response or status.
+6. Try incorrect secret and verify the request is rejected.
+7. Press Ctrl-C in the server terminal and verify it shuts down gracefully.
+
+## Notes
+
+- We can connect multiple clients to the server and see their file descriptors simultaneously.
+- The command execution intentionally sleeps 1 second in the child before exec similar to the previous assignment.
+- We have taken additional measures to ensure that the client will immediately be notified if the server is down after sending a request.
