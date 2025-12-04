@@ -1,0 +1,96 @@
+# SUFT Receiver - Small UDP-based File Transport (lab3/v2/receiver)
+
+This module implements the receiver side of the SUFT reliable UDP file transport used in lab3/v2. The receiver is an iterative UDP server that listens for an initial control packet (init), receives data packets containing a 4-byte sequence number and payload, sends cumulative ACKs, and writes the reconstructed file to disk once transfer completes.
+
+Usage
+
+```bash
+./suftd <listen_port>
+```
+
+Example:
+
+```bash
+./suftd 8000
+```
+
+Configuration and test files
+
+- `receiver.lossmodel` — test file listing up to 10 data-sequence numbers to drop (one per line) to simulate packet loss.
+- `testfl_n` — example output filename used for verifying transfers in local tests. Note that `\_n` is appended to the file name.
+
+### Key source files
+
+- `main.c`        — entry point that creates the UDP socket, reads loss model, and drives the receive loop calling the `receiver` handlers.
+- `receiver.c`    — core protocol logic: parsing init packet, allocating buffers, handling data packets, sending cumulative ACKs, and finalizing file write.
+- `file_io.c`     — read and apply `receiver.lossmodel`, decide whether to drop incoming data packet (for testing), and write received file data to disk.
+- `receiver.h`, `file_io.h` — shared data types and public function prototypes.
+
+# Detailed file/function descriptions
+
+## From `receiver.h` / `receiver.c`:
+
+- ReceiverState (struct)
+	- Fields:
+		- `filename[7]` : 6-character filename + NUL
+		- `filesize`    : total size in bytes of the original file
+		- `payloadsize` : expected payload size per data packet
+		- `numpackets`  : computed number of packets required
+		- `received`    : byte-array (flags) marking which packet indices have been received
+		- `filedata`    : buffer sized `filesize` to hold assembled data
+		- `next_expected`: smallest packet index not yet received (used for cumulative ACKs)
+		- `transfer_active`: boolean indicating transfer in-progress
+		- `sender_addr` : `struct sockaddr_in` storing client's address (for replies)
+
+- `init_receiver_state(ReceiverState *state)`
+	- Zero-initializes the `ReceiverState` structure. Called before each transfer to clear previous state.
+
+- `handle_init_packet(int sockfd, ReceiverState *state, char *packet, struct sockaddr_in *from)`
+	- Purpose: parse an incoming 16-byte init packet (6B filename + padding + filesize + payloadsize), allocate memory for tracking and storage, set a 250 ms `SO_RCVTIMEO` on the socket to wait for the first data packet, and send an initial 6-byte ACK containing the filename back to the sender.
+	- Important details:
+		- Uses `strncpy` to extract the 6-character filename and NUL-terminate.
+		- Extracts `filesize` and `payloadsize` using `ntohl()` to convert network-byte-order integers to host order.
+		- Computes `numpackets = ceil(filesize / (double)payloadsize)` and allocates `received[]` (byte flags) and `filedata` buffer accordingly.
+		- Stores the sender's address for use when sending ACKs.
+
+- `handle_data_packet(int sockfd, ReceiverState *state, char *packet, ssize_t len, struct sockaddr_in *from)`
+	- Purpose: process an incoming data packet that begins with a 4-byte sequence number (network order) followed by data. If the sequence number hasn't been received before and passes the optional loss model, copy payload into `filedata` at the correct offset and mark that index in `received[]`.
+	- Details and correctness checks:
+		- Validates packet length (at least 4 bytes for sequence).
+		- Converts the sequence number using `ntohl()`.
+		- Uses `should_drop_data(seq)` from `file_io.c` to simulate loss (if configured); dropped packets are ignored and not ACKed.
+		- If the packet is new and within range, copies `len - 4` bytes from `packet + 4` into `filedata + offset`.
+		- Updates `next_expected` by scanning forward from the previous `next_expected` until a missing packet is found.
+		- Sends a cumulative ACK containing `next_expected` (as a 4-byte `htonl()` value) to the client using `sendto()`.
+		- When `next_expected == numpackets`, the receiver finalizes the transfer: repeatedly sends several final ACKs to ensure the sender receives them, calls `write_file()` to persist the file (appending `_n` to filename), prints a success message, frees buffers, and resets state for the next transfer.
+
+- `send_ack(int sockfd, struct sockaddr_in *dest, uint32_t seq)`
+	- Helper to send a 4-byte network-order ACK (cumulative sequence number) back to the provided destination address via `sendto()`.
+
+## From `file_io.h` / `file_io.c`:
+
+- `read_receiver_loss_model()`
+	- Reads `receiver.lossmodel` (if present) into an internal `loss_seqs[]` array (up to 10 entries). Silent no-op if the file is absent.
+
+- `should_drop_data(uint32_t seq)`
+	- Returns 1 if the provided sequence number is listed in `loss_seqs[]` and hasn't yet been dropped; marks it dropped so each configured drop occurs only once. Returns 0 otherwise. Used by `handle_data_packet()` to simulate packet drops for testing.
+
+- `write_file(const char *filename, const char *data, uint32_t size)`
+	- Writes `size` bytes from `data` to disk in a file named `<filename>_n`. Uses `fopen(..., "wb")` and `fwrite()`; prints `perror()` on failure.
+
+# Protocol behavior and notes
+
+- Iterative server: `suftd` does not spawn child processes. It handles one transfer at a time, which is efficient for this assignment because tasks are short and CPU overhead is low.
+- Cumulative ACKs: the receiver acknowledges up to `next_expected`, which tells the sender that all packets with index < `next_expected` are received. This simplifies the sender's retransmission strategy.
+- Loss testing: use `receiver.lossmodel` to target dropping specific data sequence numbers to test sender retransmission behavior.
+
+
+## Testing
+
+- Start receiver and then sender (on same machine use `127.0.0.1`). Verify that after transfer completes a file named `<filename>_n` appears and matches the original.
+- Add sequence numbers to `receiver.lossmodel` to verify that the sender retransmits and that the receiver correctly handles out-of-order and retransmitted packets.
+
+### Additional Notes:
+
+- `setsockopt(..., SO_RCVTIMEO, ...)` is used in `handle_init_packet()` to enforce a short timeout waiting for the first data packet; other timeouts are handled by the sender side.
+- The receiver prints informational messages like `dropping seq N...` when a configured loss occurs, helpful for debugging.

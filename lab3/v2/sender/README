@@ -1,0 +1,98 @@
+# SUFT Sender - Small UDP-based File Transport (lab3/v2/sender)
+
+This module implements the sender for a small reliable UDP file transport (SUFT). It is intended for low-loss environments and small files (see `sender.param` limits). Build with `make` and run the sender as:
+
+```bash
+./suft <rcvip> <rcvport> <filename>
+```
+
+Example:
+
+```bash
+./suft 127.0.0.1 8000 testfl
+```
+
+IMPORTANT: In this project the filename must be exactly 6 lowercase letters. The file size must not exceed the `maxfilesize` configured in `sender.param`. `payloadsize` must not exceed ~1400 bytes (UDP safe payload).
+
+## Configuration files
+
+- `sender.param` — three lines with numeric values:
+	- `maxfilesize`  : maximum number of bytes allowed for an input file
+	- `micropace`    : microseconds to sleep between packet transmissions (e.g., 5000)
+	- `payloadsize`  : UDP payload size in bytes (suggest ≤1400)
+
+- `sender.lossmodel` — test file containing up to 10 ACK sequence numbers to drop (one per line). Each listed ACK is dropped once to simulate loss.
+
+## Key source files (high level)
+
+- `main.c`        — program entry, parameter parsing, file load, and orchestration of the transfer
+- `sender.c`      — protocol core: init handshake, packetization, send loop, and reliability logic
+- `file_io.c`     — read file into memory and manage the loss model
+- `alarm_handler.c` — helpers and signal handlers used for timing and asynchronous I/O
+- `sender.h`, `file_io.h`, `alarm_handler.h` — public prototypes and shared structures
+
+## Short summary of public functions and their roles
+
+From `main.c`:
+- `read_sender_params(SenderParams *params)` — read `sender.param` and populate `SenderParams` (maxfilesize, micropace, payloadsize).
+- `main()` — validate args, load file into memory (`read_file_to_memory()`), check constraints, load loss model, create and configure UDP socket, and run the init + data transfer phases.
+
+From `sender.c`:
+- `setup_signal_handlers()` — install `SIGIO` (for asynchronous ACK detection) and `SIGALRM` handlers; enable `O_ASYNC` on the socket for SIGIO.
+- `send_init_packet(int sock, struct sockaddr_in *dest, const char *filename, uint32_t filesize, uint32_t payloadsize)` — build and reliably send the 16-byte init packet (6B filename + 1B padding + 4B filesize + 4B payloadsize), retrying up to 5 times using `SO_RCVTIMEO` to wait for the init ACK.
+- `send_data_segments(int sock, struct sockaddr_in *dest, const char *filedata, uint32_t filesize, const SenderParams *params)` — main reliable-send loop. Maintains `ack_received[]`, `retry_count[]`, retransmits unacked segments, paces transmissions with `usleep(micropace)`, and enforces a per-packet retry limit (e.g., 10). Records completion time.
+- `sigio_handler(int sig)` — non-blocking, async handler that `recv()`s ACKs with `MSG_DONTWAIT`, extracts cumulative ACK sequence number, applies `sender.lossmodel` (via `should_drop_ack()`), and updates `ack_received[]` so the sending loop can progress.
+
+From `file_io.c`:
+- `read_file_to_memory(const char *filename, uint32_t *filesize)` — open file, allocate buffer, and read complete contents into memory (caller frees buffer).
+- `load_sender_loss_model()` — parse `sender.lossmodel` into an internal list (max 10 entries).
+- `should_drop_ack(uint32_t seq)` — return 1 if an ACK seq is configured to be dropped (used once per configured entry); otherwise 0.
+
+From `alarm_handler.c`:
+
+- `alarm_handler(int sig)` — SIGALRM handler installed by `setup_alarm_handler()`. The current implementation is an empty handler (acts as a signal interrupter) but can be extended to perform timeout bookkeeping. Its presence causes blocking system calls like `recv()` to be interrupted with `EINTR` when the timer fires.
+
+- `setup_alarm_handler(void)` — register the `alarm_handler` for `SIGALRM` using `sigaction()`. Exits on failure. Call this during initialization to ensure `start_alarm_timer()` will trigger the handler.
+
+- `start_alarm_timer(int timeout_ms)` — starts a one-shot real-time timer (via `setitimer(ITIMER_REAL)`) configured with `timeout_ms` milliseconds. Used to implement short timeouts during protocol phases (e.g., waiting for ACKs or init replies).
+
+- `stop_alarm_timer(void)` — disables the timer by zero-ing the `itimerval` structure and calling `setitimer()` again.
+
+Implementation notes:
+- The module uses `struct itimerval` and `setitimer(ITIMER_REAL, ...)` to deliver `SIGALRM` with millisecond precision. `start_alarm_timer()` converts milliseconds into `tv_sec`/`tv_usec` for the itimerval.
+- The design relies on the signal handler interrupting blocking calls (so the main loop can detect timeouts via `EINTR`) rather than doing heavy work in the handler itself. This keeps signal-handling safe and simple.
+
+## Protocol & concurrency model (concise)
+
+- Concurrency problem: the sender uses a synchronous transmit loop but must also handle incoming ACKs. The design splits responsibility:
+	- Main sending loop: only reads `ack_received[]` and issues retransmits.
+	- SIGIO handler: only writes to `ack_received[]` when ACKs arrive.
+	This avoids the need for mutexes because the handler only updates shared state and the main loop only reads it.
+
+- Reliability approach: cumulative ACKs and go-back-N style retransmissions. ACK(n) means all packets 0..n-1 are received. The SIGIO handler extracts a cumulative `ack_seq` and marks packets accordingly. The sender retransmits unacknowledged segments until either all are ACKed or per-packet retry limits are exceeded.
+
+## Tuning & behavior
+
+- `micropace` controls pacing: lower values increase throughput but risk more losses and retransmits.
+- `payloadsize` trades number-of-packets vs retransmit granularity (keep safe for MTU).
+- `sender.lossmodel` lets you test robustness by selectively dropping ACKs.
+
+## Output & errors
+
+- On success, prints completion time in milliseconds, e.g.:
+
+```text
+File transfer completed in 1234 ms
+```
+
+- Error conditions cause early exit:
+	- File too large (exceeds `maxfilesize`)
+	- Init handshake failure after 5 attempts
+	- Per-packet retry limit exceeded (e.g., 10)
+	- File I/O errors
+
+## Testing tips
+
+- Use `sender.lossmodel` to force ACK drops and verify retransmission logic.
+- Test locally with `127.0.0.1` receiver and a small test file (`testfl`).
+- Check that the `ack_received[]` behavior and `sigio_handler` update logic matches expectations: handler only writes, sender loop only reads.
